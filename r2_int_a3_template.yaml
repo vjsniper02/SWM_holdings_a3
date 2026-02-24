@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  r2-a3
+
+  Sample SAM Template for r2-a3
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Tracing: Active
+    Timeout: 300
+    MemorySize: 512
+    Layers:
+    - !Sub "{{resolve:ssm:/${EnvPrefix}/lambda-arn/common}}"
+
+Parameters:
+  EnvPrefix:
+    Type: String
+    Description: Environment Name as Prefix
+    #Default: r2dev (Please refrain from enabling this value, as it is automatically managed based on the selected environment during pipeline execution.)
+    Default: myenvironment
+
+Resources:
+  LandmarkSFTPFileTransferFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/landmark_sftp/
+      Handler: a3_landmark_sftp.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 512
+      Architectures:
+      - x86_64
+
+      Environment:
+        Variables:
+          LANDMARK_SFTP_PATH: !Sub "/${EnvPrefix}/a3/lmk_ftppath"
+          SFTP_S3_BUCKET_PA: !Sub "seil-${EnvPrefix}-holdings-file"
+          SFTP_S3_BUCKET_AUA: !Sub "seil-${EnvPrefix}-holdings-file-useraccess"
+          LOG_GROUP_NAME: !Sub "/aws/seil/${EnvPrefix}/a3"
+          LMK_SFTP_ADAPTOR_FUNCTION: !Sub "/${EnvPrefix}/lambda-arn/common/lmk-sftp-adaptor"
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetResourcePolicy
+          - secretsmanager:GetSecretValue
+          - secretsmanager:DescribeSecret
+          - secretsmanager:ListSecretVersionIds
+          Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - ssm:GetParameters
+          - ssm:DescribeParameters
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvPrefix}/*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          - s3:PutObjectACL
+          Resource: [ !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file/*", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess/*" ]
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - lambda:InvokeFunction
+          Resource: "*"
+
+      Events:
+        CADScheduler:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "rate(10 minutes)"
+            ScheduleExpressionTimezone: "Australia/Sydney"
+            Name: !Sub "${EnvPrefix}-A3-Holding-File-Scheduler"
+            Description: Holding File Scheduler configured to run every 10 minutes
+
+  HoldingPrivilegedAccessBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "seil-${EnvPrefix}-holdings-file"
+  HoldingZipBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "seil-${EnvPrefix}-holdings-file-zip"
+
+  HoldingAdminUserAccessBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "seil-${EnvPrefix}-holdings-file-useraccess"      
+
+  SCHEventReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/sch_event_receiver/
+      Handler: a3_landmark_sch_event_receiver.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+
+      Environment:
+        Variables:
+          Program_Schedule_StateMachine: !GetAtt HoldingFileStateMachine.Arn
+          Error_Bucket: !Sub "seil-${EnvPrefix}-holdings-file-useraccess"
+      Policies:
+      - AWSLambdaExecute
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:GetObjectACL
+          - s3:PutObject
+          - s3:PutObjectACL
+          - s3:ListBucket
+          - s3:DeleteObject
+          - s3:DeleteObjectACL
+          Resource:
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file/*"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess/*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - states:ListStateMachines
+          - states:ListActivities
+          - states:DescribeStateMachine
+          - states:DescribeStateMachineForExecution
+          - states:ListExecutions
+          - states:DescribeExecution
+          - states:GetExecutionHistory
+          - states:DescribeActivity
+          - states:StartExecution
+          - states:StopExecution
+          Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+
+      Events:
+        LandmarkSCHS3Bucket:
+          Type: S3
+          Properties:
+            Bucket: !Ref HoldingPrivilegedAccessBucket
+            Events: s3:ObjectCreated:*
+
+  HoldingFileStateMachine:
+    Type: AWS::Serverless::StateMachine # More info about State Machine Resource: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-statemachine.html
+    Properties:
+      Name: !Sub "${EnvPrefix}-lmk-to-agent-holding-file"
+      DefinitionUri: statemachine/agent_file_transfer.asl.json
+      DefinitionSubstitutions:
+        ParseHoldingFileFunctionArn: !GetAtt ParseHoldingFileFunction.Arn
+        ZipHoldingFileFunctionArn: !GetAtt ZipHoldingFileFunction.Arn
+        RejectedFileFunctionArn: !GetAtt RejectedFileFunction.Arn
+        GetAgencyIdFromSFFunctionArn: !GetAtt GetAgencyIdFromSFFunction.Arn
+        SendFilesToAgenciesFunctionArn: !GetAtt SendFilesToAgenciesFunction.Arn
+
+      Policies:
+      # Find out more about SAM policy templates: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-policy-templates.html
+      - LambdaInvokePolicy:
+          FunctionName: !Ref ParseHoldingFileFunction
+      - LambdaInvokePolicy:
+          FunctionName: !Ref ZipHoldingFileFunction
+      - LambdaInvokePolicy:
+          FunctionName: !Ref RejectedFileFunction
+      - LambdaInvokePolicy:
+          FunctionName: !Ref SendFilesToAgenciesFunction
+      - LambdaInvokePolicy:
+          FunctionName: !Ref GetAgencyIdFromSFFunction
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:GetObjectACL
+          - s3:PutObject
+          - s3:PutObjectACL
+          - s3:ListBucket
+          - s3:DeleteObject
+          - s3:DeleteObjectACL
+          Resource:
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file/*"
+          - !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess/*"
+
+  ZipHoldingFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/zip_holding_file/
+      Handler: a3_zip_holding_file.lambda_handler
+      Runtime: python3.13
+      MemorySize: 512
+      Architectures:
+      - x86_64
+
+      Environment:
+        Variables:
+          HOLDING_ZIP_BUCKET: !Sub "seil-${EnvPrefix}-holdings-file-zip"
+          USER_BUCKET: !Sub "seil-${EnvPrefix}-holdings-file-useraccess"
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:GetObjectACL
+          - s3:PutObject
+          - s3:PutObjectACL
+          - s3:ListBucket
+          - s3:DeleteObject
+          - s3:DeleteObjectACL
+          Resource: [ !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file/*", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-useraccess/*", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-zip", !Sub "arn:aws:s3:::seil-${EnvPrefix}-holdings-file-zip/*" ]
+
+  ParseHoldingFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/parse_holding_file/
+      Handler: a3_parse_holding_file.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+      Environment:
+        Variables:
+          CEE_LOG_GROUP_NAME: !Sub "/aws/lambda/${EnvPrefix}/CEESESNotificationLogHandler"
+          CEE_LOG_STREAM_NAME: !Sub "${EnvPrefix}_cee_notification_stream"
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Action:
+          - "logs:CreateLogGroup"
+          - "logs:CreateLogStream"
+          - "logs:PutLogEvents"
+          - "logs:GetLogEvents"
+          - "logs:DescribeLogStreams"
+          Resource: "*"
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - ssm:GetParameters
+          - ssm:DescribeParameters
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  RejectedFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/rejected_file/
+      Handler: a3_rejected_file.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+
+  GetAgencyIdFromSFFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/agency_id_sf/
+      Handler: a3_get_agency_id_sf.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+
+      Environment:
+        Variables:
+          SF_ADAPTOR: !Sub "{{resolve:ssm:/${EnvPrefix}/lambda-arn/common}}"
+          SFTP_S3_BUCKET: !Sub "seil-${EnvPrefix}-sch-file-in"
+
+  SendFilesToAgenciesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/send_file_agencies/
+      Handler: a3_send_file_agencies.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+
+      Environment:
+        Variables:
+          SFTP_S3_BUCKET: !Sub "seil-${EnvPrefix}-sch-file-in"
+          CEE_FUNCTION: !Sub "/${EnvPrefix}/cee/requestReceiverARN"
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - lambda:InvokeFunction
+          Resource: "*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - ssm:GetParameters
+          - ssm:DescribeParameters
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvPrefix}/*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - states:ListStateMachines
+          - states:ListActivities
+          - states:DescribeStateMachine
+          - states:DescribeStateMachineForExecution
+          - states:ListExecutions
+          - states:DescribeExecution
+          - states:GetExecutionHistory
+          - states:DescribeActivity
+          - states:StartExecution
+          - states:StopExecution
+          Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/seil/${EnvPrefix}/a3"
+      RetentionInDays: 30
+
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name:
+        Fn::Join:
+        - ""
+        - - ApplicationInsights-SAM-
+          - Ref: AWS::StackName
+      ResourceQuery:
+        Type: CLOUDFORMATION_STACK_1_0
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName:
+        Fn::Join:
+        - ""
+        - - ApplicationInsights-SAM-
+          - Ref: AWS::StackName
+      AutoConfigurationEnabled: "true"
+    DependsOn: ApplicationResourceGroup
+Outputs:
+  # ProgramScheduleStateMachineHourlyTradingSchedule is an implicit Schedule event rule created out of Events key under Serverless::StateMachine
+  # Find out more about other implicit resources you can reference within SAM
+  # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-specification-generated-resources.html
+  HoldingFileStateMachineArn:
+    Description: Holding File StateMachine
+    Value: !Ref HoldingFileStateMachine
+  HoldingFileStateMachineRoleArn:
+    Description: IAM Role created for A4 SCH file State machine based on the specified SAM Policy Templates
+    Value: !GetAtt HoldingFileStateMachineRole.Arn

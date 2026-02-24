@@ -1,0 +1,72 @@
+{
+  "Comment": "State machine to send holding files to Agents.",
+  "StartAt": "Parse Holding File",
+  "States": {
+    "Parse Holding File": {
+      "Type": "Task",
+      "Resource": "${ParseHoldingFileFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 1
+        }
+      ],
+      "Next": "Is File Parsing Successfull?"
+    },
+    "Is File Parsing Successfull?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.status",
+          "StringEquals": "success",
+          "Next": "Zip Holding file"
+        },
+        {
+          "Variable": "$.status",
+          "StringEquals": "failure",
+          "Next": "Send file to Rejected Bucket"
+        }
+      ]
+    },
+    "Send file to Rejected Bucket": {
+      "Type": "Task",
+      "End": true,
+      "Parameters": {
+        "Bucket.$": "$.bucket",
+        "CopySource.$": "$.copySource",
+        "Key.$": "$.target_key"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "ResultPath": null
+    },
+
+    "Zip Holding file": {
+      "Type": "Task",
+      "Resource": "${ZipHoldingFileFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 1
+        }
+      ],
+      "Next": "Send Files to Agencies via CEE"
+    },
+    "Send Files to Agencies via CEE": {
+      "Type": "Task",
+      "Resource": "${SendFilesToAgenciesFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 1
+        }
+      ],
+      "End": true
+    }
+  }
+}
